@@ -73,6 +73,10 @@ class Attention(nn.Module):
         # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
         # Defaults to False; models that want the fused kernel must pass True explicitly.
         self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
+        assert not (self.fuse_qk_norm_rope and tp_size > 1 and qk_norm_mode == "full"), (
+            "fuse_qk_norm_rope + qk_norm_mode='full' + TP>1: fused kernel lacks cross-rank "
+            "all-reduce for cross-head RMSNorm variance. Disable fuse_qk_norm_rope for TP>1."
+        )
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)

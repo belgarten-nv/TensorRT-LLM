@@ -284,8 +284,12 @@ class WanBlock(nn.Module):
         )
 
         # Self-attention with fused QKV.
-        # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
+        # fuse_qk_norm_rope: use fused cross-head QK Norm + RoPE CUDA kernel
         # to eliminate extra global memory round-trip between separate norm and RoPE.
+        # Disabled at TP>1 because the fused kernel computes RMSNorm variance over
+        # the local head shard only (no all-reduce), producing incorrect cross-head
+        # normalization. The unfused path uses TP-aware RMSNorm with all-reduce.
+        tp_size = model_config.mapping.tp_size if model_config.mapping else 1
         self.attn1 = Attention(
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
@@ -293,7 +297,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
-            fuse_qk_norm_rope=True,
+            fuse_qk_norm_rope=(tp_size == 1),
             config=model_config,
             layer_idx=_layer_idx,
         )
