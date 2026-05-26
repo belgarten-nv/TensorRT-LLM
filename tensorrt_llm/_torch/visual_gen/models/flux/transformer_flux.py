@@ -1037,6 +1037,12 @@ class FluxTransformer2DModel(nn.Module):
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
+            # Wrapper modules have no direct _parameters; handle before the guard.
+            if isinstance(module, FluxJointAttnMLPProj):
+                module_weights = loader.filter_weights(name, weights)
+                module.load_weights(module_weights, loader)
+                continue
+
             if len(module._parameters) == 0:
                 continue
 
@@ -1045,9 +1051,6 @@ class FluxTransformer2DModel(nn.Module):
 
                 if weight_dicts:
                     loader.load_linear_weights(module, name, weight_dicts)
-            elif isinstance(module, FluxJointAttnMLPProj):
-                module_weights = loader.filter_weights(name, weights)
-                module.load_weights(module_weights, loader)
             elif isinstance(module, RMSNorm):
                 module_weights = loader.filter_weights(name, weights)
                 module.load_weights(module_weights)
