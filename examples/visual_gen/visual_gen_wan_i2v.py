@@ -241,6 +241,12 @@ def parse_args():
         "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument(
+        "--tp_size",
+        type=int,
+        default=1,
+        help="TP group size",
+    )
+    parser.add_argument(
         "--parallel_vae_size",
         type=int,
         default=1,
@@ -352,14 +358,19 @@ def main():
             "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
 
+    parallel_str = ""
+    if args.tp_size > 1:
+        parallel_str = "TP(size={args.tp_size})"
+
     if args.ulysses_size > 1:
-        parallel_str = f"Ulysses(size={args.ulysses_size})"
+        parallel_str += f"Ulysses(size={args.ulysses_size})"
     elif attn2d_size > 1:
-        parallel_str = (
+        parallel_str += (
             f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
             f"total={attn2d_size})"
         )
-    else:
+
+    if not parallel_str:
         parallel_str = "None"
 
     kwargs = dict(
@@ -370,6 +381,7 @@ def main():
             "dit_ulysses_size": args.ulysses_size,
             "dit_attn2d_row_size": args.attn2d_row_size,
             "dit_attn2d_col_size": args.attn2d_col_size,
+            "dit_tp_size": args.tp_size,
             "parallel_vae_size": args.parallel_vae_size,
         },
         torch_compile={
