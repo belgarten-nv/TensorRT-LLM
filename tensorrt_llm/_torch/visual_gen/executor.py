@@ -6,10 +6,10 @@ import traceback
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-import torch
-import torch.distributed as dist
 import zmq
 
+import torch
+import torch.distributed as dist
 from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -387,7 +387,7 @@ def run_diffusion_worker(
             torch.cuda.set_device(device_id)
 
         dist.init_process_group(
-            backend="nccl" if torch.cuda.is_available() else "gloo",
+            backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
             init_method="env://",
             world_size=world_size,
             rank=rank,
