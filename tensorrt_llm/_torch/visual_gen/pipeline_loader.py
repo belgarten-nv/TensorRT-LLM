@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
-
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
@@ -123,6 +122,12 @@ class PipelineLoader:
             vgm = VisualGenMapping(world_size=1, rank=0)
         config.visual_gen_mapping = vgm
         config.mapping = vgm.to_llm_mapping()
+
+        if dist.is_initialized() and ws > 1:
+            from tensorrt_llm._utils import torch_pybind11_abi
+            from tensorrt_llm.bindings.internal.process_group import init_pg
+
+            init_pg(dist.group.WORLD, dist.group.WORLD, torch_pybind11_abi())
 
     def load(
         self,
