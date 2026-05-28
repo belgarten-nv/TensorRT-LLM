@@ -17,7 +17,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.linear import (
     Linear,
@@ -53,6 +52,7 @@ class FluxJointAttnMLPProj(nn.Module):
         skip_create_weights_in_init: bool = False,
         force_dynamic_quantization: bool = False,
         config: Optional[DiffusionModelConfig] = None,
+        attn_shard: Optional[tuple[int, int]] = None,
     ):
         super().__init__()
         mapping = config.mapping if config else None
@@ -60,6 +60,11 @@ class FluxJointAttnMLPProj(nn.Module):
         self.tp_rank = getattr(mapping, "tp_rank", 0)
         self.attn_dim = attn_dim
         self.has_bias = bias
+        self.attn_shard = attn_shard
+
+        assert attn_dim % self.tp_size == 0 or self.attn_shard, (
+            "Explicit attention sharding required for uneven TP"
+        )
 
         if self.tp_size == 1:
             self.proj = Linear(
@@ -84,6 +89,7 @@ class FluxJointAttnMLPProj(nn.Module):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 reduce_output=False,
+                override_tp_sharding=self.attn_shard,
             )
             self.mlp_proj = Linear(
                 mlp_dim,
