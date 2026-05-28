@@ -1,4 +1,3 @@
-import math
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -110,10 +109,14 @@ class Attention(nn.Module):
         assert self.num_attention_heads % self.num_key_value_heads == 0
         gqa_ratio = self.num_attention_heads // self.num_key_value_heads
 
-        kv_head_shard = math.ceil(self.num_key_value_heads / self.tp_size)
-        self.local_key_value_head_start = self.tp_rank * kv_head_shard
-        self.local_key_value_head_end = min(
-            (self.tp_rank + 1) * kv_head_shard, self.num_key_value_heads
+        def shard_start(full, size, rank):
+            return (full // size) * rank + min(full % size, rank)
+
+        self.local_key_value_head_start = shard_start(
+            self.num_key_value_heads, self.tp_size, self.tp_rank
+        )
+        self.local_key_value_head_end = shard_start(
+            self.num_key_value_heads, self.tp_size, self.tp_rank + 1
         )
         self.local_num_key_value_heads = (
             self.local_key_value_head_end - self.local_key_value_head_start
