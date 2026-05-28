@@ -16,11 +16,10 @@
 from typing import Optional
 
 import torch
-from torch import nn
-
 from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
+from torch import nn
 
 
 class RMSNormTPAware(nn.Module):
@@ -36,6 +35,7 @@ class RMSNormTPAware(nn.Module):
         enable_tp: bool = False,
         mapping: Optional[Mapping] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.NCCL,
+        override_tp_sharding: Optional[tuple] = None,
     ):
         super().__init__()
 
@@ -44,15 +44,20 @@ class RMSNormTPAware(nn.Module):
 
         self.mapping = mapping
         self.enable_tp = enable_tp
+        self.override_tp_sharding = override_tp_sharding
 
         if enable_tp:
             assert mapping is not None
             self.full_size = hidden_size
-            shard = hidden_size // mapping.tp_size
-            start = shard * mapping.tp_rank
-            end = min(shard * (mapping.tp_rank + 1), hidden_size)
-            hidden_size = end - start
+            if self.override_tp_sharding:
+                start, end = self.override_tp_sharding
+            else:
+                assert self.full_size % mapping.tp_size == 0
+                shard = hidden_size // mapping.tp_size
+                start = shard * mapping.tp_rank
+                end = min(shard * (mapping.tp_rank + 1), hidden_size)
 
+            hidden_size = end - start
             self.allreduce = AllReduce(
                 mapping=mapping, strategy=allreduce_strategy, dtype=torch.float32
             )
@@ -95,9 +100,12 @@ class RMSNormTPAware(nn.Module):
             if param is None or param_name not in weights:
                 continue
             if param_name == "weight" and self.enable_tp:
-                shard = self.full_size // self.mapping.tp_size
-                start = shard * self.mapping.tp_rank
-                end = min(shard * (self.mapping.tp_rank + 1), self.full_size)
+                if self.override_tp_sharding:
+                    start, end = self.override_tp_sharding
+                else:
+                    shard = self.full_size // self.mapping.tp_size
+                    start = shard * self.mapping.tp_rank
+                    end = shard * (self.mapping.tp_rank + 1)
                 data = weights[param_name][..., start:end]
             else:
                 data = weights[param_name]
