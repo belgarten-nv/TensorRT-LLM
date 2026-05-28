@@ -2880,42 +2880,12 @@ class Linear(nn.Module):
             'cutlass', 'cublaslt', 'cuda_core'
         ]
 
-        local_in_features = in_features
-        local_out_features = out_features
+        assert self.tp_mode in (TensorParallelMode.ROW,
+                                TensorParallelMode.COLUMN, None)
 
         self.override_tp_sharding = override_tp_sharding
-        if self.tp_mode == TensorParallelMode.ROW:
-            if type(self.override_tp_sharding) is tuple:
-                start, end = self.override_tp_sharding
-                local_in_features = end - start
-            elif type(self.override_tp_sharding) is dict:
-                local_in_features = sum(
-                    end - start
-                    for start, end in self.override_tp_sharding.values())
-            else:
-                shard = math.ceil(in_features / self.tp_size)
-                start = self.tp_rank * shard
-                end = min(start + shard, in_features)
-                local_in_features = end - start
-        elif self.tp_mode == TensorParallelMode.COLUMN:
-            if type(self.override_tp_sharding) is tuple:
-                start, end = self.override_tp_sharding
-                local_out_features = end - start
-            elif type(self.override_tp_sharding) is dict:
-                local_out_features = sum(
-                    end - start
-                    for start, end in self.override_tp_sharding.values())
-            else:
-                shard = math.ceil(out_features / self.tp_size)
-                start = self.tp_rank * shard
-                end = min(start + shard, out_features)
-                local_out_features = end - start
-            reduce_output = False if self.mapping.enable_attention_dp else reduce_output
-        else:
-            assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
-
-        self.in_features = local_in_features
-        self.out_features = local_out_features
+        self.in_features = self.calculate_local_in_features(in_features)
+        self.out_features = self.calculate_local_out_features(out_features)
 
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=allreduce_strategy,
@@ -2961,6 +2931,39 @@ class Linear(nn.Module):
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
+
+    def _calculate_local_features_helper(self, features):
+        if type(self.override_tp_sharding) is tuple:
+            assert self.weights_loading_config.weight_mode == WeightMode.VANILLA
+            start, end = self.override_tp_sharding
+            return end - start
+        elif type(self.override_tp_sharding) is dict:
+            assert self.weights_loading_config.weight_mode in (
+                WeightMode.FUSED_GATE_UP_LINEAR, WeightMode.FUSED_QKV_LINEAR)
+            return sum(end - start
+                       for start, end in self.override_tp_sharding.values())
+        else:
+            assert features % self.tp_size == 0 or self.weights_loading_config.weight_mode == WeightMode.VANILLA
+
+            def calc_shard(rank):
+                return (features // self.tp_size) * rank + min(
+                    features % self.tp_size, rank)
+
+            start = calc_shard(self.tp_rank)
+            end = calc_shard(self.tp_rank + 1)
+            return end - start
+
+    def calculate_local_in_features(self, in_features):
+        if self.tp_mode != TensorParallelMode.ROW:
+            return in_features
+
+        return self._calculate_local_features_helper(in_features)
+
+    def calculate_local_out_features(self, out_features):
+        if self.tp_mode != TensorParallelMode.COLUMN:
+            return out_features
+
+        return self._calculate_local_features_helper(out_features)
 
     def load_shard(self,
                    weights: Dict,
@@ -3020,9 +3023,13 @@ class Linear(nn.Module):
         elif type(self.override_tp_sharding) is dict:
             slice_start, slice_end = self.override_tp_sharding[name]
         else:
-            slice_width = math.ceil(width / self.tp_size)
-            slice_start = self.tp_rank * slice_width
-            slice_end = min((self.tp_rank + 1) * slice_width, width)
+
+            def calc_shard(rank):
+                return (width // self.tp_size) * rank + min(
+                    width % self.tp_size, rank)
+
+            slice_start = calc_shard(self.tp_rank)
+            slice_end = calc_shard(self.tp_rank + 1)
         slice_obj = [slice(d) for d in tensor_shape]
         slice_obj[split_dim] = slice(slice_start, slice_end)
         return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
