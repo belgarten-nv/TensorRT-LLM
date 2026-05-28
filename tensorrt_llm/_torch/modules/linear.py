@@ -2893,10 +2893,10 @@ class Linear(nn.Module):
                     end - start
                     for start, end in self.override_tp_sharding.values())
             else:
-                assert in_features % self.tp_size == 0, (
-                    f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
-                )
-                local_in_features = in_features // self.tp_size
+                shard = math.ceil(in_features / self.tp_size)
+                start = self.tp_rank * shard
+                end = min(start + shard, in_features)
+                local_in_features = end - start
         elif self.tp_mode == TensorParallelMode.COLUMN:
             if type(self.override_tp_sharding) is tuple:
                 start, end = self.override_tp_sharding
@@ -2906,14 +2906,13 @@ class Linear(nn.Module):
                     end - start
                     for start, end in self.override_tp_sharding.values())
             else:
-                assert out_features % self.tp_size == 0, (
-                    f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
-                )
-                local_out_features = out_features // self.tp_size
+                shard = math.ceil(out_features / self.tp_size)
+                start = self.tp_rank * shard
+                end = min(start + shard, out_features)
+                local_out_features = end - start
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
-            assert self.override_tp_sharding is None
 
         self.in_features = local_in_features
         self.out_features = local_out_features
