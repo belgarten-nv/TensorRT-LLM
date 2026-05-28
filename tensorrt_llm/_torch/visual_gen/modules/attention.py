@@ -3,14 +3,13 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig, SkipSoftmaxConfig
-from ..modules.rms_norm import RMSNorm
+from ..modules.rms_norm import RMSNormTPAware
 
 
 class QKVMode(str, Enum):
@@ -123,7 +122,7 @@ class Attention(nn.Module):
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
             enable_tp_rms = self.tp_size > 1 and qk_norm_mode == "full"
-            self.norm_q = RMSNorm(
+            self.norm_q = RMSNormTPAware(
                 hidden_size=q_norm_dim,
                 eps=self.eps,
                 dtype=self.dtype,
@@ -131,7 +130,7 @@ class Attention(nn.Module):
                 enable_tp=enable_tp_rms,
                 mapping=self.mapping,
             )
-            self.norm_k = RMSNorm(
+            self.norm_k = RMSNormTPAware(
                 hidden_size=k_norm_dim,
                 eps=self.eps,
                 dtype=self.dtype,
