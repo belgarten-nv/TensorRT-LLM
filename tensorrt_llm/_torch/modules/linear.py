@@ -7,12 +7,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.nn.parameter import Parameter
-
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
@@ -27,6 +24,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_sf_into_required_layout)
+from torch import nn
+from torch.nn.parameter import Parameter
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
@@ -185,9 +184,7 @@ def load_weights_vanilla_helper(module: Linear,
             assert "bias" in weights[0]
     device = torch.device('cuda')
 
-    weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                               module.tp_rank, module.tp_mode,
-                               device) if "weight" in weights[0] else None
+    weight = module.load_shard(weights[0], 'weight', device=device)
 
     if weight is not None:
         if module.has_weight_only_quant:
@@ -202,9 +199,7 @@ def load_weights_vanilla_helper(module: Linear,
         copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
-        bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
-                                 device) if "bias" in weights[0] else None
+        bias = module.load_shard(weights[0], 'bias', device=device)
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
 
@@ -226,26 +221,15 @@ def load_weights_fused_qkv_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[0] else None
-    k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[1] else None
-    v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[2] else None
+    q_weight = module.load_shard(weights[0], 'weight', device=device, name='q')
+    k_weight = module.load_shard(weights[1], 'weight', device=device, name='k')
+    v_weight = module.load_shard(weights[2], 'weight', device=device, name='v')
 
     if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[0] else None
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[1] else None
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[2] else None
+        q_bias = module.load_shard(weights[0], 'bias', device=device, name='q')
+        k_bias = module.load_shard(weights[1], 'bias', device=device, name='k')
+        v_bias = module.load_shard(weights[2], 'bias', device=device, name='v')
+
         if not allow_partial_loading:
             copy_weight(module.bias,
                         bias_transform(torch.cat((q_bias, k_bias, v_bias))))
@@ -279,19 +263,24 @@ def load_weights_fused_gate_up_helper(
         ) is not None, "Fused weight shard indices mapping is required in partial loading"
     device = torch.device('cuda')
 
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                                    module.tp_rank, module.tp_mode,
-                                    device) if "weight" in weights[0] else None
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
-                                  module.tp_rank, module.tp_mode,
-                                  device) if "weight" in weights[1] else None
+    gate_weight = module.load_shard(weights[0],
+                                    'weight',
+                                    device=device,
+                                    name='gate')
+    up_weight = module.load_shard(weights[1],
+                                  'weight',
+                                  device=device,
+                                  name='up')
+
     if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                      module.tp_rank, module.tp_mode,
-                                      device) if "bias" in weights[0] else None
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                    module.tp_rank, module.tp_mode,
-                                    device) if "bias" in weights[1] else None
+        gate_bias = module.load_shard(weights[0],
+                                      'bias',
+                                      device=device,
+                                      name='gate')
+        up_bias = module.load_shard(weights[1],
+                                    'bias',
+                                    device=device,
+                                    name='up')
         if not allow_partial_loading:
             copy_weight(module.bias,
                         bias_transform(torch.cat((gate_bias, up_bias))))
@@ -2953,6 +2942,80 @@ class Linear(nn.Module):
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
+
+    def get_tp_shard(self, name=None):
+        assert self.tp_mode is not None
+        if name is None:
+            assert type(self.tp_shard) is tuple
+
+        if type(self.tp_shard) is tuple:
+            return self.tp_shard
+        else:
+            return self.tp_shard[name]
+
+    def get_tp_shard_size(self, name=None):
+        start, end = self.get_tp_shard(name)
+        return end - start
+
+    def load_shard(self,
+                   weights: Dict,
+                   label: 'str',
+                   device: torch.device = torch.device('cpu'),
+                   name: Optional[str] = None) -> torch.tensor:
+        if label not in weights:
+            return None
+        weight = weights[label]
+
+        # Skip device transfers on integrated GPUs to conserve shared memory
+        if weight.device.type != device.type and is_device_integrated():
+            # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
+            # Avoiding device transfers reduces memory consumption and unnecessary data copies,
+            # enabling support for larger models on memory-constrained systems.
+            logger.warning_once(
+                f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
+                key="load_weight_shard_skip_device_transfer_with_integrated_gpu"
+            )
+            device = weight.device
+        if isinstance(weight, torch.Tensor):
+            tensor_shape = weight.shape
+
+            def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
+                                              indices: list[slice]
+                                              | None = None):
+                if indices is None:
+                    # Avoid unnecessary copy
+                    return tensor.to(device)
+                else:
+                    return tensor[indices].to(device)
+
+        # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
+        # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`
+        elif hasattr(weight, "get_shape"):
+            tensor_shape = weight.get_shape()
+
+            def maybe_convert_to_torch_tensor(
+                tensor, indices: Union[slice, tuple[slice]] = slice(None)):
+                return tensor[indices].to(device)
+        else:
+            raise ValueError(f'unsupported weight type: {type(weight)}')
+        if self.tp_mode is None or self.tp_size <= 1:
+            return maybe_convert_to_torch_tensor(weight)
+
+        split_dim = TensorParallelMode.split_dim(self.tp_mode)
+
+        if len(tensor_shape) == 1 and split_dim == 1:
+            return maybe_convert_to_torch_tensor(weight)
+
+        width = tensor_shape[split_dim]
+        if width == 1:
+            return maybe_convert_to_torch_tensor(weight)
+
+        slice_width = math.ceil(width / self.tp_size)
+        slice_start = self.tp_rank * slice_width
+        slice_end = min((self.tp_rank + 1) * slice_width, width)
+        slice_obj = [slice(d) for d in tensor_shape]
+        slice_obj[split_dim] = slice(slice_start, slice_end)
+        return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
     def create_weights(self):
         if self._weights_created:
