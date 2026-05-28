@@ -1,12 +1,12 @@
 import math
 from typing import Tuple
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
@@ -369,6 +369,7 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -380,6 +381,7 @@ class WanBlock(nn.Module):
                 force_dynamic_quantization=force_dynamic_quant,
                 tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
             self.norm_added_k = RMSNormTPAware(
                 hidden_size=hidden_size,
@@ -388,6 +390,7 @@ class WanBlock(nn.Module):
                 has_weights=True,
                 enable_tp=(tp_size > 1),
                 mapping=model_config.mapping,
+                override_tp_sharding=(self.attn2.local_kv_dim_start, self.attn2.local_kv_dim_end),
             )
 
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
