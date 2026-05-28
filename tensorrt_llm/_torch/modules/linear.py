@@ -2839,6 +2839,8 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         enable_gemm_allreduce_fusion: bool = True,
+        override_tp_sharding: Optional[tuple[int, int],
+                                       Dict[str, tuple[int, int]]] = None,
     ):
         """
         Args:
@@ -2881,19 +2883,37 @@ class Linear(nn.Module):
         local_in_features = in_features
         local_out_features = out_features
 
+        self.override_tp_sharding = override_tp_sharding
         if self.tp_mode == TensorParallelMode.ROW:
-            assert in_features % self.tp_size == 0, (
-                f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
-            )
-            local_in_features = in_features // self.tp_size
+            if type(self.override_tp_sharding) is tuple:
+                start, end = self.override_tp_sharding
+                local_in_features = end - start
+            elif type(self.override_tp_sharding) is dict:
+                local_in_features = sum(
+                    end - start
+                    for start, end in self.override_tp_sharding.values())
+            else:
+                assert in_features % self.tp_size == 0, (
+                    f'in_features {in_features} must be divisible by tp_size {self.tp_size}'
+                )
+                local_in_features = in_features // self.tp_size
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            assert out_features % self.tp_size == 0, (
-                f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
-            )
-            local_out_features = out_features // self.tp_size
+            if type(self.override_tp_sharding) is tuple:
+                start, end = self.override_tp_sharding
+                local_out_features = end - start
+            elif type(self.override_tp_sharding) is dict:
+                local_out_features = sum(
+                    end - start
+                    for start, end in self.override_tp_sharding.values())
+            else:
+                assert out_features % self.tp_size == 0, (
+                    f'out_features {out_features} must be divisible by tp_size {self.tp_size}'
+                )
+                local_out_features = out_features // self.tp_size
             reduce_output = False if self.mapping.enable_attention_dp else reduce_output
         else:
             assert self.tp_mode is None, f'unsupported tensor parallel mode: {self.tp_mode}'
+            assert self.override_tp_sharding is None
 
         self.in_features = local_in_features
         self.out_features = local_out_features
@@ -2942,20 +2962,6 @@ class Linear(nn.Module):
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
-
-    def get_tp_shard(self, name=None):
-        assert self.tp_mode is not None
-        if name is None:
-            assert type(self.tp_shard) is tuple
-
-        if type(self.tp_shard) is tuple:
-            return self.tp_shard
-        else:
-            return self.tp_shard[name]
-
-    def get_tp_shard_size(self, name=None):
-        start, end = self.get_tp_shard(name)
-        return end - start
 
     def load_shard(self,
                    weights: Dict,
@@ -3010,9 +3016,14 @@ class Linear(nn.Module):
         if width == 1:
             return maybe_convert_to_torch_tensor(weight)
 
-        slice_width = math.ceil(width / self.tp_size)
-        slice_start = self.tp_rank * slice_width
-        slice_end = min((self.tp_rank + 1) * slice_width, width)
+        if type(self.override_tp_sharding) is tuple:
+            slice_start, slice_end = self.override_tp_sharding
+        elif type(self.override_tp_sharding) is dict:
+            slice_start, slice_end = self.override_tp_sharding[name]
+        else:
+            slice_width = math.ceil(width / self.tp_size)
+            slice_start = self.tp_rank * slice_width
+            slice_end = min((self.tp_rank + 1) * slice_width, width)
         slice_obj = [slice(d) for d in tensor_shape]
         slice_obj[split_dim] = slice(slice_start, slice_end)
         return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
