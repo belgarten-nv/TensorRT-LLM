@@ -168,10 +168,12 @@ class FluxJointQKVMLPProj(nn.Module):
         skip_create_weights_in_init: bool = False,
         force_dynamic_quantization: bool = False,
         mapping: Optional[Mapping] = None,
+        override_qkv_sharding=None,
     ):
         super().__init__()
 
         self.tp_size = mapping.tp_size if mapping else 1
+        self.tp_rank = mapping.tp_rank if mapping else 0
 
         # Store full (pre-TP) dims for weight loading (splitting checkpoint weight)
         self.full_q_dim = q_dim
@@ -194,9 +196,8 @@ class FluxJointQKVMLPProj(nn.Module):
             self.local_qkv_dim = q_dim + 2 * kv_dim
             self.local_mlp_dim = mlp_dim
         else:
-            local_q_dim = q_dim // self.tp_size
-            local_kv_dim = kv_dim // self.tp_size
-            shard_mlp_hidden_dim = self.mlp_hidden_dim // self.tp_size
+            local_q_dim = (lambda start, end: end - start)(*override_qkv_sharding["q"])
+            local_kv_dim = (lambda start, end: end - start)(*override_qkv_sharding["k"])
             # QKV: column-parallel with fused Q/K/V sharding
             self.qkv_proj = Linear(
                 in_dim,
@@ -217,8 +218,19 @@ class FluxJointQKVMLPProj(nn.Module):
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                override_tp_sharding=override_qkv_sharding,
             )
+
             # MLP gate+up: column-parallel with fused gate/up sharding
+            def calc_shard(rank):
+                return (self.mlp_hidden_dim // self.tp_size) * rank + min(
+                    self.mlp_hidden_dim % self.tp_size, rank
+                )
+
+            local_mlp_hidden_start = calc_shard(self.tp_rank)
+            local_mlp_hidden_end = calc_shard(self.tp_rank + 1)
+            local_mlp_hidden_size = local_mlp_hidden_end - local_mlp_hidden_start
+
             self.mlp_proj = Linear(
                 in_dim,
                 mlp_dim,
@@ -231,15 +243,19 @@ class FluxJointQKVMLPProj(nn.Module):
                     weight_mode=WeightMode.FUSED_GATE_UP_LINEAR,
                 ),
                 fused_weight_shard_indices_mapping={
-                    "gate": (0, shard_mlp_hidden_dim),
-                    "up": (shard_mlp_hidden_dim, shard_mlp_hidden_dim),
+                    "gate": (0, local_mlp_hidden_size),
+                    "up": (local_mlp_hidden_size, local_mlp_hidden_size),
                 },
                 mapping=mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
+                override_tp_sharding={
+                    "gate": (local_mlp_hidden_start, local_mlp_hidden_end),
+                    "up": (local_mlp_hidden_start, local_mlp_hidden_end),
+                },
             )
             self.local_qkv_dim = (q_dim + 2 * kv_dim) // self.tp_size
-            self.local_mlp_dim = mlp_dim // self.tp_size
+            self.local_mlp_dim = local_mlp_hidden_size
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns (qkv, mlp_gate_up) with local (post-TP) sizes."""

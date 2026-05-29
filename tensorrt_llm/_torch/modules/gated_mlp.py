@@ -3,10 +3,9 @@ from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from torch import nn
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -62,11 +61,23 @@ class GatedMLP(nn.Module):
 
         # Calculate local intermediate size after tensor parallel sharding
         tp_size = mapping.tp_size
-        local_intermediate_size = self.intermediate_size // tp_size
+
+        def calc_shard(rank):
+            return (self.intermediate_size // tp_size) * rank + min(
+                self.intermediate_size % tp_size, rank)
+
+        local_intermediate_start = calc_shard(mapping.tp_rank)
+        local_intermediate_end = calc_shard(mapping.tp_rank + 1)
+        local_intermediate_size = local_intermediate_end - local_intermediate_start
 
         gateup_shard_indices_mapping = {
             'gate': (0, local_intermediate_size),
             'up': (local_intermediate_size, local_intermediate_size),
+        }
+
+        override_tp_sharding = {
+            'gate': (local_intermediate_start, local_intermediate_end),
+            'up': (local_intermediate_start, local_intermediate_end),
         }
 
         self.gate_up_proj = Linear(
@@ -87,6 +98,7 @@ class GatedMLP(nn.Module):
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            override_tp_sharding=override_tp_sharding,
         )
 
         if is_shared_expert:

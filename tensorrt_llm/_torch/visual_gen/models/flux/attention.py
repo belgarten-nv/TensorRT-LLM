@@ -350,6 +350,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             config=config,
+            attn_shard=(self.local_q_dim_start, self.local_q_dim_end),
         )
 
     def _init_qkv_proj(self):
@@ -366,6 +367,11 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
             mapping=self.mapping,
+            override_qkv_sharding={
+                "q": (self.local_q_dim_start, self.local_q_dim_end),
+                "k": (self.local_kv_dim_start, self.local_kv_dim_end),
+                "v": (self.local_kv_dim_start, self.local_kv_dim_end),
+            },
         )
 
     def _apply_norm_rope_unfused(
