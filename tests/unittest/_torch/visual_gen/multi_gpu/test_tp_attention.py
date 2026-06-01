@@ -46,6 +46,8 @@ try:
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.mapping import Mapping
 
+    from .tp_shard_utils import shard_fused_qkv_by_heads
+
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -155,67 +157,71 @@ def _shard_tp_weights(ref_attn, tp_attn, tp_rank, tp_size, qkv_mode=QKVMode.FUSE
     """
     with torch.no_grad():
         if qkv_mode == QKVMode.FUSE_QKV:
-            # Fused QKV: weight is [q_dim + 2*kv_dim, hidden_size]
-            full_w = ref_attn.qkv_proj.weight.data
             q_dim = ref_attn.q_dim
             kv_dim = ref_attn.kv_dim
-            q_w, k_w, v_w = full_w.split([q_dim, kv_dim, kv_dim], dim=0)
-
-            q_shard = _shard_dim0(q_w, tp_rank, tp_size)
-            k_shard = _shard_dim0(k_w, tp_rank, tp_size)
-            v_shard = _shard_dim0(v_w, tp_rank, tp_size)
-            tp_attn.qkv_proj.weight.data.copy_(torch.cat([q_shard, k_shard, v_shard], dim=0))
+            tp_attn.qkv_proj.weight.data.copy_(
+                shard_fused_qkv_by_heads(
+                    ref_attn.qkv_proj.weight.data,
+                    tp_rank,
+                    tp_size,
+                    ref_attn.num_attention_heads,
+                    ref_attn.num_key_value_heads,
+                    ref_attn.head_dim,
+                    q_dim,
+                    kv_dim,
+                )
+            )
 
             if ref_attn.qkv_proj.bias is not None:
-                full_b = ref_attn.qkv_proj.bias.data
-                q_b, k_b, v_b = full_b.split([q_dim, kv_dim, kv_dim], dim=0)
                 tp_attn.qkv_proj.bias.data.copy_(
-                    torch.cat(
-                        [
-                            _shard_dim0(q_b, tp_rank, tp_size),
-                            _shard_dim0(k_b, tp_rank, tp_size),
-                            _shard_dim0(v_b, tp_rank, tp_size),
-                        ],
-                        dim=0,
+                    shard_fused_qkv_by_heads(
+                        ref_attn.qkv_proj.bias.data,
+                        tp_rank,
+                        tp_size,
+                        ref_attn.num_attention_heads,
+                        ref_attn.num_key_value_heads,
+                        ref_attn.head_dim,
+                        q_dim,
+                        kv_dim,
                     )
                 )
         else:
-            for name in ("to_q", "to_k", "to_v"):
+            q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
+            kv_start, kv_end = tp_attn.local_kv_dim_start, tp_attn.local_kv_dim_end
+            for name, bounds in (
+                ("to_q", (q_start, q_end)),
+                ("to_k", (kv_start, kv_end)),
+                ("to_v", (kv_start, kv_end)),
+            ):
                 ref_proj = getattr(ref_attn, name)
                 tp_proj = getattr(tp_attn, name)
-                tp_proj.weight.data.copy_(_shard_dim0(ref_proj.weight.data, tp_rank, tp_size))
+                start, end = bounds
+                tp_proj.weight.data.copy_(ref_proj.weight.data[start:end].contiguous())
                 if ref_proj.bias is not None:
-                    tp_proj.bias.data.copy_(_shard_dim0(ref_proj.bias.data, tp_rank, tp_size))
+                    tp_proj.bias.data.copy_(ref_proj.bias.data[start:end].contiguous())
 
-        # Output projection: row-parallel (split input dim = dim 1)
+        # Output projection: row-parallel (split input dim = dim 1, head-aligned)
         ref_out = ref_attn.to_out[0]
         tp_out = tp_attn.to_out[0]
-        shard_size = math.ceil(ref_out.weight.shape[1] / tp_size)
-        start = tp_rank * shard_size
-        end = min(start + shard_size, ref_out.weight.shape[1])
-        tp_out.weight.data.copy_(ref_out.weight.data[:, start:end].contiguous())
+        q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
+        tp_out.weight.data.copy_(ref_out.weight.data[:, q_start:q_end].contiguous())
         if ref_out.bias is not None:
             tp_out.bias.data.copy_(ref_out.bias.data)
 
-        # QK norm weights (if TP-enabled, they're sharded)
+        # QK norm weights (if TP-enabled, use Attention head-based shard bounds)
         if hasattr(ref_attn, "norm_q") and hasattr(tp_attn, "norm_q"):
             if tp_attn.norm_q.enable_tp:
-                shard_size = ref_attn.norm_q.weight.shape[0] // tp_size
-                start = tp_rank * shard_size
-                end = start + shard_size
-                tp_attn.norm_q.weight.data.copy_(ref_attn.norm_q.weight.data[start:end])
-                tp_attn.norm_k.weight.data.copy_(ref_attn.norm_k.weight.data[start:end])
+                tp_attn.norm_q.weight.data.copy_(
+                    ref_attn.norm_q.weight.data[tp_attn.local_q_dim_start : tp_attn.local_q_dim_end]
+                )
+                tp_attn.norm_k.weight.data.copy_(
+                    ref_attn.norm_k.weight.data[
+                        tp_attn.local_kv_dim_start : tp_attn.local_kv_dim_end
+                    ]
+                )
             else:
                 tp_attn.norm_q.weight.data.copy_(ref_attn.norm_q.weight.data)
                 tp_attn.norm_k.weight.data.copy_(ref_attn.norm_k.weight.data)
-
-
-def _shard_dim0(tensor, tp_rank, tp_size):
-    """Shard a tensor along dim 0 (works for both 1D bias and 2D weight)."""
-    shard_size = math.ceil(tensor.shape[0] / tp_size)
-    start = tp_rank * shard_size
-    end = min(start + shard_size, tensor.shape[0])
-    return tensor[start:end].contiguous()
 
 
 # =============================================================================
@@ -397,8 +403,9 @@ def _logic_tp_hidden_512(rank, world_size):
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=4)
 
 
-def _logic_tp_heads_not_divisible(rank, world_size):
-    """TP when num_heads % tp_size != 0. Expected to fail until uneven sharding is implemented."""
+def _logic_tp_size_3_uneven_heads(rank, world_size):
+    """TP=3 when num_heads and hidden_size are not divisible by tp_size."""
+    assert world_size == 3
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=320, num_heads=5)
 
 
@@ -488,9 +495,9 @@ class TestTPAttentionEdgeCases:
     def test_hidden_512(self):
         _run(2, _logic_tp_hidden_512)
 
-    @pytest.mark.xfail(reason="Uneven head sharding not yet implemented", raises=Exception)
-    def test_tp_heads_not_divisible(self):
-        _run(2, _logic_tp_heads_not_divisible)
+    def test_tp_size_3_uneven_heads(self):
+        """TP=3 with 5 heads (2+2+1 split) matches F.sdpa reference."""
+        _run(3, _logic_tp_size_3_uneven_heads)
 
     def test_tp_world_size_4(self):
         _run(4, _logic_tp_world_size_4)
