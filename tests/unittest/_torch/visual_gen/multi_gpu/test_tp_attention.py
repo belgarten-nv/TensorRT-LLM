@@ -46,8 +46,6 @@ try:
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.mapping import Mapping
 
-    from .tp_shard_utils import shard_fused_qkv_by_heads
-
     MODULES_AVAILABLE = True
 except ImportError:
     MODULES_AVAILABLE = False
@@ -156,38 +154,39 @@ def _shard_tp_weights(ref_attn, tp_attn, tp_rank, tp_size, qkv_mode=QKVMode.FUSE
     RMSNorm (TP-enabled): split weight
     """
     with torch.no_grad():
+        q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
+        kv_start, kv_end = tp_attn.local_kv_dim_start, tp_attn.local_kv_dim_end
+
         if qkv_mode == QKVMode.FUSE_QKV:
-            q_dim = ref_attn.q_dim
-            kv_dim = ref_attn.kv_dim
+            q_w, k_w, v_w = ref_attn.qkv_proj.weight.data.split(
+                [ref_attn.q_dim, ref_attn.kv_dim, ref_attn.kv_dim], dim=0
+            )
             tp_attn.qkv_proj.weight.data.copy_(
-                shard_fused_qkv_by_heads(
-                    ref_attn.qkv_proj.weight.data,
-                    tp_rank,
-                    tp_size,
-                    ref_attn.num_attention_heads,
-                    ref_attn.num_key_value_heads,
-                    ref_attn.head_dim,
-                    q_dim,
-                    kv_dim,
-                )
+                torch.cat(
+                    [
+                        q_w[q_start:q_end],
+                        k_w[kv_start:kv_end],
+                        v_w[kv_start:kv_end],
+                    ],
+                    dim=0,
+                ).contiguous()
             )
 
             if ref_attn.qkv_proj.bias is not None:
+                q_b, k_b, v_b = ref_attn.qkv_proj.bias.data.split(
+                    [ref_attn.q_dim, ref_attn.kv_dim, ref_attn.kv_dim], dim=0
+                )
                 tp_attn.qkv_proj.bias.data.copy_(
-                    shard_fused_qkv_by_heads(
-                        ref_attn.qkv_proj.bias.data,
-                        tp_rank,
-                        tp_size,
-                        ref_attn.num_attention_heads,
-                        ref_attn.num_key_value_heads,
-                        ref_attn.head_dim,
-                        q_dim,
-                        kv_dim,
-                    )
+                    torch.cat(
+                        [
+                            q_b[q_start:q_end],
+                            k_b[kv_start:kv_end],
+                            v_b[kv_start:kv_end],
+                        ],
+                        dim=0,
+                    ).contiguous()
                 )
         else:
-            q_start, q_end = tp_attn.local_q_dim_start, tp_attn.local_q_dim_end
-            kv_start, kv_end = tp_attn.local_kv_dim_start, tp_attn.local_kv_dim_end
             for name, bounds in (
                 ("to_q", (q_start, q_end)),
                 ("to_k", (kv_start, kv_end)),
@@ -405,15 +404,16 @@ def _logic_tp_hidden_512(rank, world_size):
 
 def _logic_tp_size_3_uneven_heads(rank, world_size):
     """TP=3 when num_heads and hidden_size are not divisible by tp_size."""
-    assert world_size == 3
-    _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=320, num_heads=5)
+    _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=8)
 
 
 def _logic_tp_world_size_4(rank, world_size):
     _run_tp_with_params(rank, world_size, batch=2, seq=16, hidden_size=512, num_heads=16)
 
 
-def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
+def _logic_tp_ulysses_combined(
+    rank, world_size, ulysses_size, tp_size, hidden_size=512, num_heads=16
+):
     """TP + Ulysses combined matches F.sdpa reference on the full sequence.
 
     4 GPUs: tp_size=2, ulysses_size=2.
@@ -422,8 +422,6 @@ def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
     assert tp_size * ulysses_size == world_size
     device = torch.device(f"cuda:{rank}")
 
-    hidden_size = 512
-    num_heads = 16
     head_dim = hidden_size // num_heads
     batch = 2
     seq_per_rank = 8
@@ -465,6 +463,18 @@ def _logic_tp_ulysses_combined(rank, world_size, ulysses_size, tp_size):
     torch.testing.assert_close(combined_out, expected_shard, rtol=1e-2, atol=1e-2)
 
 
+def _logic_tp3_ulysses_uneven_combined(rank, world_size):
+    """TP=3 + Ulysses=2 with 8 attention heads (4+2+2 TP split)."""
+    _logic_tp_ulysses_combined(
+        rank,
+        world_size,
+        ulysses_size=2,
+        tp_size=3,
+        hidden_size=512,
+        num_heads=8,
+    )
+
+
 # =============================================================================
 # Test classes
 # =============================================================================
@@ -496,7 +506,7 @@ class TestTPAttentionEdgeCases:
         _run(2, _logic_tp_hidden_512)
 
     def test_tp_size_3_uneven_heads(self):
-        """TP=3 with 5 heads (2+2+1 split) matches F.sdpa reference."""
+        """TP=3 with 8 heads (4+2+2 split) matches F.sdpa reference."""
         _run(3, _logic_tp_size_3_uneven_heads)
 
     def test_tp_world_size_4(self):
@@ -523,6 +533,9 @@ class TestTPUlyssesCombined:
         ulysses_size = 2
         world = ulysses_size * tp_size
         _run(world, _logic_tp_ulysses_combined, ulysses_size, tp_size)
+
+    def test_tp_3_ulysses_2_uneven(self):
+        _run(6, _logic_tp3_ulysses_uneven_combined)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,6 @@ try:
     from .tp_shard_utils import (
         copy_tp_parameter,
         shard_dim1,
-        shard_dim1_range,
         shard_fused_gate_up,
         shard_fused_qkv_by_heads,
     )
@@ -158,20 +157,16 @@ _FLUX2_TEST_CONFIG = dict(
     timestep_guidance_channels=256,
 )
 
-# TP=3 uneven configs: 5 heads (2+2+1) and MLP dims not divisible by 3.
+# TP=3 uneven configs: 8 heads already gives an uneven 3+3+2 attention split.
 _FLUX1_UNEVEN_TP3_CONFIG = {
     **_FLUX1_TEST_CONFIG,
-    "num_attention_heads": 5,
-    "attention_head_dim": 64,
-    # inner_dim=320, FFN intermediate=1280 (1280 % 3 == 2)
+    # FLUX.1 FFN intermediate is 512 * 4 = 2048, also uneven over TP=3.
 }
 
 _FLUX2_UNEVEN_TP3_CONFIG = {
     **_FLUX2_TEST_CONFIG,
-    "num_attention_heads": 5,
-    "attention_head_dim": 64,
     "mlp_ratio": 3.5,
-    # inner_dim=320, mlp_hidden=1120 (1120 % 3 == 1)
+    # Keep heads unchanged; make FLUX.2 MLP hidden dim 512 * 3.5 = 1792, uneven over TP=3.
 }
 
 
@@ -228,6 +223,8 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
     ref_params = dict(ref_model.named_parameters())
     num_heads = config_dict["num_attention_heads"]
     head_dim = config_dict["attention_head_dim"]
+    vgm = getattr(tp_model.model_config, "visual_gen_mapping", None)
+    ulysses_size = vgm.ulysses_size if vgm is not None else 1
     handled_tp_params = set()
 
     for tp_name, tp_module in tp_model.named_modules():
@@ -237,7 +234,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
             w_mlp = ref_w[:, tp_module.attn_dim :]
             attn_start, attn_end = tp_module.attn_shard
             tp_model.get_parameter(f"{tp_name}.attn_proj.weight").data.copy_(
-                shard_dim1_range(w_attn, attn_start, attn_end)
+                w_attn[:, attn_start:attn_end].contiguous()
             )
             tp_model.get_parameter(f"{tp_name}.mlp_proj.weight").data.copy_(
                 shard_dim1(w_mlp, tp_rank, tp_size)
@@ -268,6 +265,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
                     head_dim,
                     tp_module.full_q_dim,
                     tp_module.full_kv_dim,
+                    ulysses_size,
                 )
             )
             tp_model.get_parameter(f"{tp_name}.mlp_proj.weight").data.copy_(
@@ -293,6 +291,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
                         head_dim,
                         tp_module.full_q_dim,
                         tp_module.full_kv_dim,
+                        ulysses_size,
                     )
                 )
                 tp_model.get_parameter(f"{tp_name}.mlp_proj.bias").data.copy_(
@@ -317,6 +316,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
                 tp_size,
                 num_heads,
                 head_dim,
+                ulysses_size=ulysses_size,
             )
 
 
@@ -375,7 +375,6 @@ def _logic_flux1_tp_vs_single_gpu(rank, world_size):
 
 def _logic_flux1_tp3_uneven_vs_single_gpu(rank, world_size):
     """FLUX.1: TP=3 with uneven head/MLP dims matches single-GPU reference."""
-    assert world_size == 3
     _logic_flux1_tp_vs_single_gpu_with_config(rank, world_size, _FLUX1_UNEVEN_TP3_CONFIG)
 
 
@@ -389,7 +388,7 @@ def _logic_flux1_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     batch = 1
     img_seq = 16
     txt_seq = 8
-    in_channels = config_dict["in_channels"]
+    in_channels = 64
 
     # Create single-GPU reference model
     torch.manual_seed(123)
@@ -496,7 +495,6 @@ def _logic_flux2_tp_vs_single_gpu(rank, world_size):
 
 def _logic_flux2_tp3_uneven_vs_single_gpu(rank, world_size):
     """FLUX.2: TP=3 with uneven head/MLP dims matches single-GPU reference."""
-    assert world_size == 3
     _logic_flux2_tp_vs_single_gpu_with_config(rank, world_size, _FLUX2_UNEVEN_TP3_CONFIG)
 
 
@@ -510,7 +508,7 @@ def _logic_flux2_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
     batch = 1
     img_seq = 16
     txt_seq = 8
-    in_channels = config_dict["in_channels"]
+    in_channels = 128
 
     # Create single-GPU reference model
     torch.manual_seed(123)
@@ -674,11 +672,11 @@ class TestFluxUnevenTP3:
     """TP=3 tests where head count and MLP dims are not divisible by tp_size."""
 
     def test_flux1_tp3_uneven_vs_single_gpu(self):
-        """FLUX.1 TP=3 (5 heads, uneven MLP) matches single-GPU reference."""
+        """FLUX.1 TP=3 (8 heads, uneven MLP) matches single-GPU reference."""
         run_test_in_distributed(world_size=3, test_fn=_logic_flux1_tp3_uneven_vs_single_gpu)
 
     def test_flux2_tp3_uneven_vs_single_gpu(self):
-        """FLUX.2 TP=3 (5 heads, uneven MLP) matches single-GPU reference."""
+        """FLUX.2 TP=3 (8 heads, uneven MLP) matches single-GPU reference."""
         run_test_in_distributed(world_size=3, test_fn=_logic_flux2_tp3_uneven_vs_single_gpu)
 
 

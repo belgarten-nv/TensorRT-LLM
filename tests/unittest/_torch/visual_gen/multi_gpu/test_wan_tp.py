@@ -145,19 +145,10 @@ _WAN_I2V_TEST_CONFIG = dict(
     added_kv_proj_dim=256,  # add_k_proj input dim = hidden_size (image embeds projected to hidden_size before blocks)
 )
 
-# TP=3 uneven configs: 5 heads (2+2+1) and ffn_dim=512 (512 % 3 == 2).
-_WAN_UNEVEN_TP3_CONFIG = {
-    **_WAN_T2V_TEST_CONFIG,
-    "num_attention_heads": 5,
-    "attention_head_dim": 64,
-    "ffn_dim": 512,
-}
-
-_WAN_I2V_UNEVEN_TP3_CONFIG = {
-    **_WAN_UNEVEN_TP3_CONFIG,
-    "image_dim": 64,
-    "added_kv_proj_dim": 320,
-}
+# Existing WAN configs are already uneven with TP=3:
+# 4 attention heads split as 2+1+1, and ffn_dim=512 is not divisible by 3.
+_WAN_UNEVEN_TP3_CONFIG = dict(_WAN_T2V_TEST_CONFIG)
+_WAN_I2V_UNEVEN_TP3_CONFIG = dict(_WAN_I2V_TEST_CONFIG)
 
 
 # =============================================================================
@@ -218,6 +209,8 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
     ref_params = dict(ref_model.named_parameters())
     num_heads = config_dict["num_attention_heads"]
     head_dim = config_dict["attention_head_dim"]
+    vgm = getattr(tp_model.model_config, "visual_gen_mapping", None)
+    ulysses_size = vgm.ulysses_size if vgm is not None else 1
 
     with torch.no_grad():
         for tp_name, tp_param in tp_model.named_parameters():
@@ -231,6 +224,7 @@ def _copy_ref_weights_to_tp(ref_model, tp_model, tp_rank, tp_size, config_dict):
                 tp_size,
                 num_heads,
                 head_dim,
+                ulysses_size=ulysses_size,
             )
 
 
@@ -285,7 +279,6 @@ def _logic_wan_t2v_tp_vs_single_gpu(rank, world_size):
 
 def _logic_wan_t2v_tp3_uneven_vs_single_gpu(rank, world_size):
     """WAN T2V: TP=3 with uneven head/FFN dims matches single-GPU reference."""
-    assert world_size == 3
     _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_UNEVEN_TP3_CONFIG)
 
 
@@ -298,7 +291,7 @@ def _logic_wan_t2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
 
     batch = 1
     T, H, W = 2, 4, 4
-    in_channels = config_dict["in_channels"]
+    in_channels = 16
     txt_seq = 8
 
     # Create single-GPU reference model
@@ -460,7 +453,6 @@ def _logic_wan_i2v_tp_vs_single_gpu(rank, world_size):
 
 def _logic_wan_i2v_tp3_uneven_vs_single_gpu(rank, world_size):
     """WAN I2V: TP=3 with uneven head/FFN dims matches single-GPU reference."""
-    assert world_size == 3
     _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, _WAN_I2V_UNEVEN_TP3_CONFIG)
 
 
@@ -473,7 +465,7 @@ def _logic_wan_i2v_tp_vs_single_gpu_with_config(rank, world_size, config_dict):
 
     batch = 1
     T, H, W = 2, 4, 4
-    in_channels = config_dict["in_channels"]
+    in_channels = 16
     txt_seq = 8
     img_seq = 4
 
@@ -567,11 +559,11 @@ class TestWanUnevenTP3:
     """TP=3 tests where head count and FFN dims are not divisible by tp_size."""
 
     def test_wan_t2v_tp3_uneven_vs_single_gpu(self):
-        """WAN T2V TP=3 (5 heads, uneven FFN) matches single-GPU reference."""
+        """WAN T2V TP=3 (4 heads, uneven FFN) matches single-GPU reference."""
         run_test_in_distributed(world_size=3, test_fn=_logic_wan_t2v_tp3_uneven_vs_single_gpu)
 
     def test_wan_i2v_tp3_uneven_vs_single_gpu(self):
-        """WAN I2V TP=3 (5 heads, uneven FFN) matches single-GPU reference."""
+        """WAN I2V TP=3 (4 heads, uneven FFN) matches single-GPU reference."""
         run_test_in_distributed(world_size=3, test_fn=_logic_wan_i2v_tp3_uneven_vs_single_gpu)
 
 
