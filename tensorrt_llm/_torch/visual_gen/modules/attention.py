@@ -3,6 +3,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+
 from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -106,36 +107,7 @@ class Attention(nn.Module):
         self.q_dim = self.num_attention_heads * self.head_dim
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
-        assert self.num_attention_heads % self.num_key_value_heads == 0
-        gqa_ratio = self.num_attention_heads // self.num_key_value_heads
-
-        def shard_start(full, size, rank):
-            return (full // size) * rank + min(full % size, rank)
-
-        self.local_key_value_head_start = shard_start(
-            self.num_key_value_heads, self.tp_size, self.tp_rank
-        )
-        self.local_key_value_head_end = shard_start(
-            self.num_key_value_heads, self.tp_size, self.tp_rank + 1
-        )
-        self.local_num_key_value_heads = (
-            self.local_key_value_head_end - self.local_key_value_head_start
-        )
-
-        self.local_attention_head_start = gqa_ratio * self.local_key_value_head_start
-        self.local_attention_head_end = gqa_ratio * self.local_key_value_head_end
-        self.local_num_attention_heads = (
-            self.local_attention_head_end - self.local_attention_head_start
-        )
-
-        self.local_q_dim_start = self.local_attention_head_start * self.head_dim
-        self.local_q_dim_end = self.local_attention_head_end * self.head_dim
-        self.local_q_dim = self.local_q_dim_end - self.local_q_dim_start
-
-        self.local_kv_dim_start = self.local_key_value_head_start * self.head_dim
-        self.local_kv_dim_end = self.local_key_value_head_end * self.head_dim
-        self.local_kv_dim = self.local_kv_dim_end - self.local_kv_dim_start
-
+        self._calculate_tp_parameters(ulysses_size if enable_ulysses else None)
         self._init_qkv_proj()
 
         # Structural eligibility for SEPARATE_QKV self-attn quantize dedup.
@@ -270,6 +242,46 @@ class Attention(nn.Module):
             enable_sequence_parallel=enable_sequence_parallel,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+    def _calculate_tp_parameters(self, ulysses_size: Optional[int]):
+        assert self.num_attention_heads % self.num_key_value_heads == 0
+        gqa_ratio = self.num_attention_heads // self.num_key_value_heads
+
+        if not ulysses_size:
+            ulysses_size = 1
+
+        assert self.num_key_value_heads % ulysses_size == 0
+        # Note: this is intentionally stronger than `num_kv_head >= ulysses_size * tp_size`
+        assert self.num_key_value_heads // ulysses_size >= self.tp_size
+
+        def _calc_shard(full, size, rank):
+            full //= ulysses_size
+            shard = (full // size) * rank + min(full % size, rank)
+            return shard * ulysses_size
+
+        self.local_key_value_head_start = _calc_shard(
+            self.num_key_value_heads, self.tp_size, self.tp_rank
+        )
+        self.local_key_value_head_end = _calc_shard(
+            self.num_key_value_heads, self.tp_size, self.tp_rank + 1
+        )
+        self.local_num_key_value_heads = (
+            self.local_key_value_head_end - self.local_key_value_head_start
+        )
+
+        self.local_attention_head_start = gqa_ratio * self.local_key_value_head_start
+        self.local_attention_head_end = gqa_ratio * self.local_key_value_head_end
+        self.local_num_attention_heads = (
+            self.local_attention_head_end - self.local_attention_head_start
+        )
+
+        self.local_q_dim_start = self.local_attention_head_start * self.head_dim
+        self.local_q_dim_end = self.local_attention_head_end * self.head_dim
+        self.local_q_dim = self.local_q_dim_end - self.local_q_dim_start
+
+        self.local_kv_dim_start = self.local_key_value_head_start * self.head_dim
+        self.local_kv_dim_end = self.local_key_value_head_end * self.head_dim
+        self.local_kv_dim = self.local_kv_dim_end - self.local_kv_dim_start
 
     def _init_qkv_proj(self) -> None:
         tp_mode = TensorParallelMode.COLUMN if self.tp_size > 1 else None
