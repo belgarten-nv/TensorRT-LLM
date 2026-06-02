@@ -2943,6 +2943,7 @@ class Linear(nn.Module):
         _uneven_tp_unsupported = {QuantAlgo.NVFP4_ARC}
         _quant_algo = quant_config.quant_algo if quant_config else None
         if override_tp_sharding is not None:
+            assert _quant_algo not in _uneven_tp_unsupported
             self.tp_sharding = override_tp_sharding
         elif self.tp_size > 1 and self.tp_mode is not None \
                 and self.weights_loading_config.weight_mode == WeightMode.VANILLA \
