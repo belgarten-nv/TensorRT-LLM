@@ -7,12 +7,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.nn.parameter import Parameter
-
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
@@ -27,6 +24,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_sf_into_required_layout)
+from torch import nn
+from torch.nn.parameter import Parameter
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
@@ -722,18 +721,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                            shard_keys: list[str] = None):
         input_scales, weight_scales = {}, {}
         if shard_keys is None:
-            for w in weights:
-                if "input_scale" in w:
-                    input_scales[None] = w["input_scale"][...].reshape([])
-                if "weight_scale" in w:
-                    weight_scales[None] = w["weight_scale"][...].reshape([])
-        else:
-            for shard_key, w in zip(shard_keys, weights):
-                if "input_scale" in w:
-                    input_scales[shard_key] = w["input_scale"][...].reshape([])
-                if "weight_scale" in w:
-                    weight_scales[shard_key] = w["weight_scale"][...].reshape(
-                        [])
+            shard_keys = [None]
+        for shard_key, w in zip(shard_keys, weights):
+            if "input_scale" in w:
+                input_scales[shard_key] = w["input_scale"][...].reshape([])
+            if "weight_scale" in w:
+                weight_scales[shard_key] = w["weight_scale"][...].reshape([])
         return input_scales, weight_scales
 
     def load_weights_vanilla(self,
@@ -2237,23 +2230,16 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         device = torch.device("cuda")
         scale_span = 32 if module.tp_mode == TensorParallelMode.ROW else 1
 
-        if shard_keys is not None:
-            for shard_key, w in zip(shard_keys, weights):
-                if "weight_scale" in w:
-                    ws = module.load_shard(w["weight_scale"],
-                                           device=device,
-                                           scale_span=scale_span,
-                                           name=shard_key).contiguous()
-                    assert ws.dtype == torch.uint8
-                    weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
-        else:
-            for w in weights:
-                if "weight_scale" in w:
-                    ws = module.load_shard(w["weight_scale"],
-                                           device=device,
-                                           scale_span=scale_span).contiguous()
-                    assert ws.dtype == torch.uint8
-                    weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
+        if shard_keys is None:
+            shard_keys = [None]
+        for shard_key, w in zip(shard_keys, weights):
+            if "weight_scale" in w:
+                ws = module.load_shard(w["weight_scale"],
+                                       device=device,
+                                       scale_span=scale_span,
+                                       name=shard_key).contiguous()
+                assert ws.dtype == torch.uint8
+                weight_scale.append(ws.view(fp4_utils.float4_sf_dtype))
         return weight_scale
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
@@ -3098,7 +3084,7 @@ class Linear(nn.Module):
             # Avoiding device transfers reduces memory consumption and unnecessary data copies,
             # enabling support for larger models on memory-constrained systems.
             logger.warning_once(
-                f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
+                f"[Linear.load_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
                 key="load_weight_shard_skip_device_transfer_with_integrated_gpu"
             )
             device = weight.device
