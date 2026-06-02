@@ -16,10 +16,12 @@
 from typing import Optional
 
 import torch
+from torch import nn
+
 from tensorrt_llm._torch.distributed import AllReduce
+from tensorrt_llm._torch.modules.linear import Linear  # for Linear._calc_shard
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
-from torch import nn
 
 
 class RMSNormTPAware(nn.Module):
@@ -44,36 +46,44 @@ class RMSNormTPAware(nn.Module):
 
         self.mapping = mapping
         self.enable_tp = enable_tp
-        self.override_tp_sharding = override_tp_sharding
+
+        self.hidden_size = hidden_size
 
         if enable_tp:
             assert mapping is not None
-            self.full_size = hidden_size
-            if self.override_tp_sharding:
-                start, end = self.override_tp_sharding
-            else:
-                assert self.full_size % mapping.tp_size == 0
-                shard = hidden_size // mapping.tp_size
-                start = shard * mapping.tp_rank
-                end = min(shard * (mapping.tp_rank + 1), hidden_size)
 
-            hidden_size = end - start
+            if override_tp_sharding:
+                self.tp_sharding = override_tp_sharding
+            else:
+                start = Linear._calc_shard(self.hidden_size, mapping.tp_size, mapping.tp_rank)
+                end = Linear._calc_shard(self.hidden_size, mapping.tp_size, mapping.tp_rank + 1)
+                self.tp_sharding = (start, end)
+
+            start, end = self.tp_sharding
+            self.local_hidden_size = end - start
             self.allreduce = AllReduce(
                 mapping=mapping, strategy=allreduce_strategy, dtype=torch.float32
             )
         else:
+            self.local_hidden_size = self.hidden_size
             self.allreduce = None
 
         if use_gemma and not has_weights:
             raise ValueError("has_weights must be True if use_gemma is True")
         if has_weights:
             if not use_gemma:
-                self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
+                self.weight = nn.Parameter(
+                    torch.ones(self.local_hidden_size, dtype=dtype, device=device)
+                )
             else:
-                self.weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype, device=device))
+                self.weight = nn.Parameter(
+                    torch.zeros(self.local_hidden_size, dtype=dtype, device=device)
+                )
         else:
             self.register_buffer(
-                "weight", torch.ones(hidden_size, dtype=dtype, device=device), persistent=False
+                "weight",
+                torch.ones(self.local_hidden_size, dtype=dtype, device=device),
+                persistent=False,
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -83,7 +93,7 @@ class RMSNormTPAware(nn.Module):
         x2 = hidden_states.pow(2)
         if self.allreduce:
             x2_sum = x2.sum(-1, keepdim=True)
-            variance = self.allreduce(x2_sum) / self.full_size
+            variance = self.allreduce(x2_sum) / self.hidden_size
         else:
             variance = x2.mean(-1, keepdim=True)
 
@@ -100,12 +110,7 @@ class RMSNormTPAware(nn.Module):
             if param is None or param_name not in weights:
                 continue
             if param_name == "weight" and self.enable_tp:
-                if self.override_tp_sharding:
-                    start, end = self.override_tp_sharding
-                else:
-                    shard = self.full_size // self.mapping.tp_size
-                    start = shard * self.mapping.tp_rank
-                    end = shard * (self.mapping.tp_rank + 1)
+                start, end = self.tp_sharding
                 data = weights[param_name][..., start:end]
             else:
                 data = weights[param_name]

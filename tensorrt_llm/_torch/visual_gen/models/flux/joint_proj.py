@@ -17,6 +17,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+
 from tensorrt_llm._torch.distributed.ops import AllReduce
 from tensorrt_llm._torch.modules.linear import (
     Linear,
@@ -196,8 +197,12 @@ class FluxJointQKVMLPProj(nn.Module):
             self.local_qkv_dim = q_dim + 2 * kv_dim
             self.local_mlp_dim = mlp_dim
         else:
-            local_q_dim = (lambda start, end: end - start)(*override_qkv_sharding["q"])
-            local_kv_dim = (lambda start, end: end - start)(*override_qkv_sharding["k"])
+
+            def range_size(r):
+                return r[1] - r[0]
+
+            local_q_dim = range_size(override_qkv_sharding["q"])
+            local_kv_dim = range_size(override_qkv_sharding["k"])
             # QKV: column-parallel with fused Q/K/V sharding
             self.qkv_proj = Linear(
                 in_dim,
@@ -221,14 +226,12 @@ class FluxJointQKVMLPProj(nn.Module):
                 override_tp_sharding=override_qkv_sharding,
             )
 
-            # MLP gate+up: column-parallel with fused gate/up sharding
-            def calc_shard(rank):
-                return (self.mlp_hidden_dim // self.tp_size) * rank + min(
-                    self.mlp_hidden_dim % self.tp_size, rank
-                )
-
-            local_mlp_hidden_start = calc_shard(self.tp_rank)
-            local_mlp_hidden_end = calc_shard(self.tp_rank + 1)
+            local_mlp_hidden_start = Linear._calc_shard(
+                self.mlp_hidden_dim, self.tp_size, self.tp_rank
+            )
+            local_mlp_hidden_end = Linear._calc_shard(
+                self.mlp_hidden_dim, self.tp_size, self.tp_rank + 1
+            )
             local_mlp_hidden_size = local_mlp_hidden_end - local_mlp_hidden_start
 
             self.mlp_proj = Linear(

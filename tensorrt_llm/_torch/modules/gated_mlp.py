@@ -3,9 +3,10 @@ from typing import Optional, Union
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from torch import nn
 
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
@@ -62,12 +63,12 @@ class GatedMLP(nn.Module):
         # Calculate local intermediate size after tensor parallel sharding
         tp_size = mapping.tp_size
 
-        def calc_shard(rank):
-            return (self.intermediate_size // tp_size) * rank + min(
-                self.intermediate_size % tp_size, rank)
-
-        local_intermediate_start = calc_shard(mapping.tp_rank)
-        local_intermediate_end = calc_shard(mapping.tp_rank + 1)
+        local_intermediate_start = Linear._calc_shard(self.intermediate_size,
+                                                      mapping.tp_size,
+                                                      mapping.tp_rank)
+        local_intermediate_end = Linear._calc_shard(self.intermediate_size,
+                                                    mapping.tp_size,
+                                                    mapping.tp_rank + 1)
         local_intermediate_size = local_intermediate_end - local_intermediate_start
 
         gateup_shard_indices_mapping = {
