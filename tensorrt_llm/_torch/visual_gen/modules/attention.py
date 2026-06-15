@@ -251,20 +251,13 @@ class Attention(nn.Module):
             ulysses_size = 1
 
         assert self.num_key_value_heads % ulysses_size == 0
-        # Note: this is intentionally stronger than `num_kv_head >= ulysses_size * tp_size`
         assert self.num_key_value_heads // ulysses_size >= self.tp_size
 
-        def _calc_shard(full, size, rank):
-            full //= ulysses_size
-            shard = (full // size) * rank + min(full % size, rank)
-            return shard * ulysses_size
-
-        self.local_key_value_head_start = _calc_shard(
-            self.num_key_value_heads, self.tp_size, self.tp_rank
-        )
-        self.local_key_value_head_end = _calc_shard(
-            self.num_key_value_heads, self.tp_size, self.tp_rank + 1
-        )
+        kv_heads_per_ulysses = self.num_key_value_heads // ulysses_size
+        self.local_key_value_head_start = Linear._calc_shard(
+            kv_heads_per_ulysses, self.tp_size, self.tp_rank) * ulysses_size
+        self.local_key_value_head_end = Linear._calc_shard(
+            kv_heads_per_ulysses, self.tp_size, self.tp_rank + 1) * ulysses_size
         self.local_num_key_value_heads = (
             self.local_key_value_head_end - self.local_key_value_head_start
         )
