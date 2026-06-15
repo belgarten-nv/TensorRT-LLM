@@ -107,7 +107,7 @@ class Attention(nn.Module):
         self.q_dim = self.num_attention_heads * self.head_dim
         self.kv_dim = self.num_key_value_heads * self.head_dim
 
-        self._calculate_tp_parameters(ulysses_size if enable_ulysses else None)
+        self._calculate_tp_parameters(ulysses_size if enable_sequence_parallel else None)
         self._init_qkv_proj()
 
         # Structural eligibility for SEPARATE_QKV self-attn quantize dedup.
