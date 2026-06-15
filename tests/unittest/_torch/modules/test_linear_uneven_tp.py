@@ -13,10 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import math
 
 import pytest
@@ -28,6 +24,7 @@ from tensorrt_llm._torch.modules.linear import (
     WeightMode,
     WeightsLoadingConfig,
 )
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -44,11 +41,6 @@ class FakeMapping(Mapping):
             tp_size=world_size,
         )
         self.tp_rank = rank
-
-
-def calc_shard(total, tp_size, rank):
-    """Mirror the shard math in Linear._calculate_local_features_helper."""
-    return (total // tp_size) * rank + min(total % tp_size, rank)
 
 
 @pytest.fixture(autouse=True)
@@ -158,6 +150,8 @@ def build_weights(in_features, out_features, quant_algo, bias=True):
 
         # FP4 E2M1: 1.0 = 0b0010. Super-diagonal: M[i, i+1] = 1.
         # Packed pairs: element i+1 sits in byte (i+1)//2, nibble (i+1)%2.
+        # This is an easy way to generate synthetic data that will not cause
+        # overflows but still requires cross-gpu communication (ie not block diagonal)
         packed_cols = in_features // 2
         raw = torch.zeros(out_features, packed_cols, dtype=torch.uint8)
         for i in range(min(out_features, in_features - 1)):
@@ -334,12 +328,39 @@ def build_linears(
     return linears, weights
 
 
+def _fused_shard_indices_mapping(shard_keys, ranges):
+    mapping = {}
+    offset = 0
+    for key in shard_keys:
+        start, end = ranges[key]
+        size = end - start
+        mapping[key] = (offset, size)
+        offset += size
+    return mapping
+
+
+def _prepare_fused_weights_for_loading(weights, quant_algo):
+    if quant_algo == QuantAlgo.NVFP4:
+        shared_weight_scale_2 = weights[0]["weight_scale_2"].clone()
+        for weight in weights:
+            weight["weight_scale"] = weight["weight_scale"].view(torch.float8_e4m3fn)
+            weight["weight_scale_2"] = shared_weight_scale_2.clone()
+
+
 def build_fused_linears(
-    in_features, sub_out_features, world_size, quant_algo, weight_mode, shard_keys, overrides=None
+    in_features,
+    sub_out_features,
+    world_size,
+    quant_algo,
+    weight_mode,
+    shard_keys,
+    overrides=None,
+    allow_partial_loading=False,
 ):
     weights = [
         build_weights(in_features, sub_out_features, quant_algo, bias=True)[0] for _ in shard_keys
     ]
+    _prepare_fused_weights_for_loading(weights, quant_algo)
     dtype = DEFAULT_DTYPES[quant_algo]
     if overrides is not None:
         assert len(overrides) == world_size
@@ -348,6 +369,11 @@ def build_fused_linears(
         mapping = FakeMapping(world_size, rank)
         quant_config = QuantConfig(quant_algo=quant_algo)
         override = overrides[rank] if overrides is not None else None
+        shard_indices_mapping = (
+            _fused_shard_indices_mapping(shard_keys, override)
+            if override is not None and (allow_partial_loading or quant_algo == QuantAlgo.NVFP4)
+            else None
+        )
         linear = Linear(
             in_features,
             sub_out_features * len(shard_keys),
@@ -358,9 +384,12 @@ def build_fused_linears(
             weights_loading_config=WeightsLoadingConfig(weight_mode=weight_mode),
             reduce_output=False,
             override_tp_sharding=override,
+            fused_weight_shard_indices_mapping=shard_indices_mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
         )
-        linear.load_weights(weights)
+        linear.load_weights(weights, allow_partial_loading=allow_partial_loading)
+        if allow_partial_loading:
+            linear.process_weights_after_loading()
         linear.post_load_weights()
         linear.cuda()
         linears.append(linear)
@@ -373,6 +402,9 @@ def build_fused_reference(
     dtype = DEFAULT_DTYPES[quant_algo]
     mapping = FakeMapping(1, 0)
     quant_config = QuantConfig(quant_algo=quant_algo)
+    shard_indices_mapping = _fused_shard_indices_mapping(
+        shard_keys, {key: (0, sub_out_features) for key in shard_keys}
+    )
     ref = Linear(
         in_features,
         sub_out_features * len(shard_keys),
@@ -382,6 +414,7 @@ def build_fused_reference(
         quant_config=quant_config,
         weights_loading_config=WeightsLoadingConfig(weight_mode=weight_mode),
         reduce_output=False,
+        fused_weight_shard_indices_mapping=shard_indices_mapping,
         tensor_parallel_mode=TensorParallelMode.COLUMN,
     )
     ref.load_weights(weights)
@@ -554,6 +587,10 @@ class TestMLP:
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 89,
+    reason="FP8 per-tensor is supported on SM 89+ GPUs",
+)
 class TestFP8QDQMLP:
     """FP8QDQ: unified input → ColumnParallel → RowParallel → sum."""
 
@@ -615,6 +652,10 @@ class TestFP8QDQMLP:
 FP8R = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
 
 
+@pytest.mark.skipif(
+    get_sm_version() != 90,
+    reason="FP8 rowwise is supported on Hopper GPUs",
+)
 class TestFP8RowwiseMLP:
     """FP8 Rowwise: unified input → ColumnParallel → RowParallel → sum."""
 
@@ -690,6 +731,10 @@ FP8BS_PIPELINE_CASES = [
 ]
 
 
+@pytest.mark.skipif(
+    not (get_sm_version() == 90 or is_sm_100f()),
+    reason="FP8 block scales are supported on Hopper and SM 100 family GPUs",
+)
 class TestFP8BlockScalesMLP:
     """FP8 Block Scales: column → row pipeline."""
 
@@ -741,6 +786,10 @@ class TestFP8BlockScalesMLP:
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="This test is only supported on SM 100 family GPUs",
+)
 class TestNVFP4MLP:
     """NVFP4: column → row pipeline. ROW requires 16-aligned shard boundaries."""
 
@@ -799,6 +848,10 @@ class TestNVFP4MLP:
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="This test is only supported on SM 100 family GPUs",
+)
 class TestW4A8MXFP4FP8MLP:
     """W4A8 MXFP4/FP8: column → row pipeline.
 
@@ -857,6 +910,10 @@ class TestW4A8MXFP4FP8MLP:
         torch.testing.assert_close(result, expected, rtol=0.2, atol=0.2)
 
 
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="This test is only supported on SM 100 family GPUs",
+)
 class TestW4A8NVFP4FP8MLP:
     """W4A8 NVFP4/FP8: column → row pipeline.
 
@@ -915,6 +972,10 @@ class TestW4A8NVFP4FP8MLP:
         torch.testing.assert_close(result, expected, rtol=0.2, atol=0.2)
 
 
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="This test is only supported on SM 100 family GPUs",
+)
 class TestW4A8MXFP4MXFP8MLP:
     """W4A8 MXFP4/MXFP8: inherits W4A8MXFP4FP8, uses mxfp8_quantize for activation."""
 
@@ -970,6 +1031,10 @@ class TestW4A8MXFP4MXFP8MLP:
         torch.testing.assert_close(result, expected, rtol=0.2, atol=0.2)
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 80,
+    reason="Weight-only INT8/INT4 is supported on Ampere+ GPUs",
+)
 class TestWeightOnlyQuantMLP:
     """Weight-only INT8 and INT4 quantization."""
 
@@ -1028,10 +1093,9 @@ class TestWeightOnlyQuantMLP:
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
-class TestAWQMLP:
-    """AWQ INT4 variants with grouped scales."""
+class _AWQMLPMixin:
+    quant_algo = None
 
-    @pytest.mark.parametrize("quant_algo", [QuantAlgo.W4A16_AWQ, QuantAlgo.W4A8_AWQ])
     @pytest.mark.parametrize(
         "dim,tp_size",
         [
@@ -1039,7 +1103,8 @@ class TestAWQMLP:
             (640, 3),  # uneven: 128-group shards -> 256,256,128
         ],
     )
-    def test_pipeline(self, dim, tp_size, quant_algo):
+    def test_pipeline(self, dim, tp_size):
+        quant_algo = self.quant_algo
         col_linears, col_weights = build_linears(
             dim,
             dim,
@@ -1082,6 +1147,26 @@ class TestAWQMLP:
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(
+    get_sm_version() < 80,
+    reason="W4A16 AWQ is supported on Ampere+ GPUs",
+)
+class TestW4A16AWQMLP(_AWQMLPMixin):
+    """W4A16 AWQ with grouped scales."""
+
+    quant_algo = QuantAlgo.W4A16_AWQ
+
+
+@pytest.mark.skipif(
+    not (get_sm_version() in (89, 90) or is_sm_100f()),
+    reason="W4A8 AWQ is supported on Ada, Hopper, and SM 100 family GPUs",
+)
+class TestW4A8AWQMLP(_AWQMLPMixin):
+    """W4A8 AWQ with grouped scales."""
+
+    quant_algo = QuantAlgo.W4A8_AWQ
+
+
 FUSED_QUANT_ALGO = QuantAlgo.W4A8_MXFP4_FP8
 
 
@@ -1093,8 +1178,6 @@ class TestFusedLinearLoading:
         [
             (WeightMode.FUSED_QKV_LINEAR, QuantAlgo.NO_QUANT, 96, 3),
             (WeightMode.FUSED_GATE_UP_LINEAR, QuantAlgo.NO_QUANT, 96, 3),
-            (WeightMode.FUSED_QKV_LINEAR, FUSED_QUANT_ALGO, 256, 2),
-            (WeightMode.FUSED_GATE_UP_LINEAR, FUSED_QUANT_ALGO, 256, 2),
         ],
     )
     def test_even_no_override(self, weight_mode, quant_algo, sub_out, tp_size):
@@ -1119,7 +1202,7 @@ class TestFusedLinearLoading:
             for linear in linears:
                 assert linear.weight_scale.numel() > 0
 
-    @pytest.mark.parametrize("quant_algo", [QuantAlgo.NO_QUANT, FUSED_QUANT_ALGO])
+    @pytest.mark.parametrize("quant_algo", [QuantAlgo.NO_QUANT])
     @pytest.mark.parametrize(
         "weight_mode",
         [
@@ -1150,6 +1233,138 @@ class TestFusedLinearLoading:
         if quant_algo != QuantAlgo.NO_QUANT:
             for linear in linears:
                 assert linear.weight_scale.numel() > 0
+
+    @pytest.mark.parametrize("quant_algo", [QuantAlgo.NO_QUANT])
+    @pytest.mark.parametrize(
+        "weight_mode",
+        [
+            WeightMode.FUSED_QKV_LINEAR,
+            WeightMode.FUSED_GATE_UP_LINEAR,
+        ],
+    )
+    def test_uneven_override_partial_loading(self, weight_mode, quant_algo):
+        shard_keys = weight_mode.shard_keys
+        sub_out = 640
+        tp_size = 3
+        boundaries = [(0, 256), (256, 512), (512, 640)]
+        overrides = [{key: boundary for key in shard_keys} for boundary in boundaries]
+        linears, weights = build_fused_linears(
+            256,
+            sub_out,
+            tp_size,
+            quant_algo,
+            weight_mode,
+            shard_keys,
+            overrides=overrides,
+            allow_partial_loading=True,
+        )
+        ranges = [{key: boundary for key in shard_keys} for boundary in boundaries]
+
+        ref = build_fused_reference(256, sub_out, quant_algo, weight_mode, shard_keys, weights)
+        _check_fused_weight_reconstruction(linears, weights, shard_keys, ranges)
+        _check_fused_forward(linears, ref, shard_keys, ranges, quant_algo)
+        if quant_algo != QuantAlgo.NO_QUANT:
+            for linear in linears:
+                assert linear.weight_scale.numel() > 0
+
+
+@pytest.mark.skipif(
+    not is_sm_100f(),
+    reason="Fused FP4/NVFP4 loading is supported on SM 100 family GPUs",
+)
+class TestFusedQuantizedLinearLoading:
+    """Quantized fused QKV and Gate/Up loading for override uneven TP."""
+
+    @pytest.mark.parametrize(
+        "weight_mode,quant_algo,sub_out,tp_size",
+        [
+            (WeightMode.FUSED_QKV_LINEAR, FUSED_QUANT_ALGO, 256, 2),
+            (WeightMode.FUSED_GATE_UP_LINEAR, FUSED_QUANT_ALGO, 256, 2),
+        ],
+    )
+    def test_even_no_override(self, weight_mode, quant_algo, sub_out, tp_size):
+        shard_keys = weight_mode.shard_keys
+        linears, weights = build_fused_linears(
+            256,
+            sub_out,
+            tp_size,
+            quant_algo,
+            weight_mode,
+            shard_keys,
+        )
+        ranges = []
+        for rank in range(tp_size):
+            start, end = _legacy_even_slice(sub_out, tp_size, rank)
+            ranges.append({key: (start, end) for key in shard_keys})
+
+        ref = build_fused_reference(256, sub_out, quant_algo, weight_mode, shard_keys, weights)
+        _check_fused_weight_reconstruction(linears, weights, shard_keys, ranges)
+        _check_fused_forward(linears, ref, shard_keys, ranges, quant_algo)
+        for linear in linears:
+            assert linear.weight_scale.numel() > 0
+
+    @pytest.mark.parametrize("quant_algo", [FUSED_QUANT_ALGO])
+    @pytest.mark.parametrize(
+        "weight_mode",
+        [
+            WeightMode.FUSED_QKV_LINEAR,
+            WeightMode.FUSED_GATE_UP_LINEAR,
+        ],
+    )
+    def test_uneven_override(self, weight_mode, quant_algo):
+        shard_keys = weight_mode.shard_keys
+        sub_out = 640
+        tp_size = 3
+        boundaries = [(0, 256), (256, 512), (512, 640)]
+        overrides = [{key: boundary for key in shard_keys} for boundary in boundaries]
+        linears, weights = build_fused_linears(
+            256,
+            sub_out,
+            tp_size,
+            quant_algo,
+            weight_mode,
+            shard_keys,
+            overrides=overrides,
+        )
+        ranges = [{key: boundary for key in shard_keys} for boundary in boundaries]
+
+        ref = build_fused_reference(256, sub_out, quant_algo, weight_mode, shard_keys, weights)
+        _check_fused_weight_reconstruction(linears, weights, shard_keys, ranges)
+        _check_fused_forward(linears, ref, shard_keys, ranges, quant_algo)
+        for linear in linears:
+            assert linear.weight_scale.numel() > 0
+
+    @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4])
+    @pytest.mark.parametrize(
+        "weight_mode",
+        [
+            WeightMode.FUSED_QKV_LINEAR,
+            WeightMode.FUSED_GATE_UP_LINEAR,
+        ],
+    )
+    def test_uneven_override_partial_loading(self, weight_mode, quant_algo):
+        shard_keys = weight_mode.shard_keys
+        sub_out = 640
+        tp_size = 3
+        boundaries = [(0, 256), (256, 512), (512, 640)]
+        overrides = [{key: boundary for key in shard_keys} for boundary in boundaries]
+        linears, weights = build_fused_linears(
+            256,
+            sub_out,
+            tp_size,
+            quant_algo,
+            weight_mode,
+            shard_keys,
+            overrides=overrides,
+            allow_partial_loading=True,
+        )
+        ranges = [{key: boundary for key in shard_keys} for boundary in boundaries]
+
+        ref = build_fused_reference(256, sub_out, quant_algo, weight_mode, shard_keys, weights)
+        _check_fused_weight_reconstruction(linears, weights, shard_keys, ranges)
+        _check_fused_forward(linears, ref, shard_keys, ranges, quant_algo)
+        for linear in linears:
+            assert linear.weight_scale.numel() > 0
 
 
 if __name__ == "__main__":

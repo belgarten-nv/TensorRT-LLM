@@ -7,9 +7,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, Optional, Union
 
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 import torch
 import torch.nn.functional as F
+from torch import nn
+from torch.nn.parameter import Parameter
+
+import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
@@ -24,8 +27,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.utils.fp8_utils import (
     per_token_quant_and_transform, resmooth_to_fp8_e8m0,
     transform_sf_into_required_layout)
-from torch import nn
-from torch.nn.parameter import Parameter
 
 from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
